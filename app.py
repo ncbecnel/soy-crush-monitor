@@ -3,6 +3,7 @@ import requests
 import pandas as pd
 import numpy as np
 import time
+from concurrent.futures import ThreadPoolExecutor
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
@@ -231,27 +232,35 @@ def fetch_psd_stocks_to_use(commodity_code: str, country: str = "US") -> pd.Data
     """
     if not USDA_FAS_KEY:
         return pd.DataFrame(columns=["market_year", "ending_stocks", "use", "stocks_to_use"])
-    rows = []
-    for year in PSD_YEARS:
+
+    def fetch_year(year: int):
         try:
             url = f"https://api.fas.usda.gov/api/psd/commodity/{commodity_code}/country/{country}/year/{year}"
             r = _get_with_retry(url, headers={"X-Api-Key": USDA_FAS_KEY}, retries=2)
             data = r.json()
         except Exception as e:
             print(f"fetch_psd_stocks_to_use({commodity_code!r}, year={year}) failed: {type(e).__name__}: {e}")
-            continue
+            return None
         by_attr = {row["attributeId"]: row["value"] for row in data}
         stocks = by_attr.get(PSD_ATTR_ENDING_STOCKS)
         exports = by_attr.get(PSD_ATTR_EXPORTS)
         dom_use = by_attr.get(PSD_ATTR_DOM_CONSUMPTION)
         if stocks is None or exports is None or dom_use is None:
-            continue
+            return None
         use = exports + dom_use
-        rows.append({
+        return {
             "market_year": year, "ending_stocks": stocks, "use": use,
             "stocks_to_use": stocks / use if use > 0 else None,
-        })
-    return pd.DataFrame(rows)
+        }
+
+    # One request per year (PSD's API has no bulk "all years" endpoint), but
+    # the requests are independent, so fire them concurrently instead of
+    # waiting on 15 sequential round trips -- this was the single biggest
+    # contributor to a slow cold load.
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(fetch_year, PSD_YEARS))
+    rows = [r for r in results if r is not None]
+    return pd.DataFrame(rows).sort_values("market_year").reset_index(drop=True)
 
 
 # FAS PSD commodity codes (confirmed live against /api/psd/commodities)
@@ -282,19 +291,26 @@ def fetch_nass_soybean_fundamentals() -> pd.DataFrame:
         "yield_bu_acre":  "SOYBEANS - YIELD, MEASURED IN BU / ACRE",
         "production_bu":  "SOYBEANS - PRODUCTION, MEASURED IN BU",
     }
-    frames = []
-    for col, short_desc in series.items():
+
+    def fetch_series(item):
+        col, short_desc = item
         try:
             r = _get_with_retry(base, params={**common, "short_desc": short_desc}, retries=2)
             rows = r.json().get("data", [])
         except Exception as e:
             print(f"fetch_nass_soybean_fundamentals({col!r}) failed: {type(e).__name__}: {e}")
-            continue
+            return None
         if not rows:
-            continue
+            return None
         fdf = pd.DataFrame(rows)
         fdf[col] = fdf["Value"].str.replace(",", "", regex=False).astype(float)
-        frames.append(fdf[["year", col]])
+        return fdf[["year", col]]
+
+    # These three series are independent NASS queries -- fetch concurrently
+    # rather than waiting on three sequential round trips.
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(fetch_series, series.items()))
+    frames = [f for f in results if f is not None]
     if not frames:
         return pd.DataFrame(columns=["year", "planted_acres", "yield_bu_acre", "production_bu"])
     out = frames[0]
@@ -315,13 +331,30 @@ BUSHELS_PER_METRIC_TON = LBS_PER_METRIC_TON / LBS_PER_BUSHEL  # ~36.74
 
 @st.cache_data(ttl=3600)
 def build_master() -> dict:
+    # All seven sources below are independent of each other, so fetch them
+    # concurrently instead of one after another -- sequentially this was
+    # ~23 round trips (3 FRED + 2 AMS + 15 PSD-per-year + 3 NASS series)
+    # before anything could render.
+    with ThreadPoolExecutor(max_workers=7) as pool:
+        f_soy      = pool.submit(fetch_fred, "PSOYBUSDM")
+        f_oil      = pool.submit(fetch_fred, "PSOILUSDM")
+        f_meal     = pool.submit(fetch_fred, "PSMEAUSDM")
+        f_ams_soy  = pool.submit(fetch_ams_daily_soybean_price)
+        f_ams_om   = pool.submit(fetch_ams_weekly_oil_meal)
+        f_stu      = pool.submit(fetch_psd_stocks_to_use, PSD_CODE_SOYBEANS)
+        f_fnd      = pool.submit(fetch_nass_soybean_fundamentals)
+
+        soy  = f_soy.result().rename(columns={"value": "soy_usd_tonne"})
+        oil  = f_oil.result().rename(columns={"value": "oil_usd_tonne"})
+        meal = f_meal.result().rename(columns={"value": "meal_usd_tonne"})
+        ams_soy = f_ams_soy.result()
+        ams_om  = f_ams_om.result()
+        stu = f_stu.result()
+        fundamentals = f_fnd.result()
+
     # FRED global prices, all $/metric ton, monthly — the baseline series
     # that works with zero USDA registration, since crush margin needs all
     # three legs (soybeans, oil, meal) on a common daily-mergeable timeline.
-    soy  = fetch_fred("PSOYBUSDM").rename(columns={"value": "soy_usd_tonne"})
-    oil  = fetch_fred("PSOILUSDM").rename(columns={"value": "oil_usd_tonne"})
-    meal = fetch_fred("PSMEAUSDM").rename(columns={"value": "meal_usd_tonne"})
-
     fred = soy.merge(oil, on="period").merge(meal, on="period").sort_values("period").reset_index(drop=True)
 
     # Convert to US industry convention units before applying the board-crush formula.
@@ -338,8 +371,6 @@ def build_master() -> dict:
     # everything before AMS's coverage window starts, so the lookback
     # selector still has years of history even though AMS itself only goes
     # back to 2022-2023.
-    ams_soy = fetch_ams_daily_soybean_price()
-    ams_om  = fetch_ams_weekly_oil_meal()
     if not ams_soy.empty and not ams_om.empty:
         ams = pd.merge_asof(ams_soy, ams_om.dropna(subset=["oil_cents_lb", "meal_usd_st"], how="all"),
                              on="period", direction="backward")
@@ -356,16 +387,6 @@ def build_master() -> dict:
     df["oil_value_per_bu"]  = df["oil_cents_lb"] / 100 * OIL_LBS_PER_BUSHEL
     df["meal_value_per_bu"] = df["meal_usd_st"] * (MEAL_LBS_PER_BUSHEL / LBS_PER_SHORT_TON)
     df["crush_margin"]      = df["oil_value_per_bu"] + df["meal_value_per_bu"] - df["soy_usd_bu"]
-
-    # USDA stocks-to-use ratio (optional, needs USDA_FAS_KEY) — the ag
-    # equivalent of the Cushing-inventory proxy: how tight the market is
-    # relative to how much gets consumed, the standard driver of ag price
-    # volatility and seasonality.
-    stu = fetch_psd_stocks_to_use(PSD_CODE_SOYBEANS)
-
-    # US planted acreage / yield / production (optional, needs USDA_NASS_KEY)
-    # — the production-side driver upstream of stocks-to-use above.
-    fundamentals = fetch_nass_soybean_fundamentals()
 
     return {
         "crush": df,
