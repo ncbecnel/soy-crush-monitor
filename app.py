@@ -140,22 +140,69 @@ def fetch_fred(series_id: str, days: int = 3650) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=3600)
-def fetch_ams_daily_price(report_id: str) -> pd.DataFrame:
-    """Daily cash grain bids from USDA AMS MyMarketNews (marsapi.ams.usda.gov).
-    Returns an empty frame (not an error) if USDA_AMS_KEY isn't set, so the
-    app falls back to FRED's monthly series instead of breaking.
+def fetch_ams_daily_soybean_price() -> pd.DataFrame:
+    """Daily soybean cash price from Illinois Grain Bids (AMS_3192), Mississippi
+    River barge-loading elevators -- a standard export-linked benchmark, and the
+    same crush-belt region used for the oil/meal legs below. USDA publishes two
+    quotes per date during a basis revision (current="Yes"/"No"); we keep only
+    the current one. Empty frame if USDA_AMS_KEY isn't set or the fetch fails.
     """
     if not USDA_AMS_KEY:
-        return pd.DataFrame(columns=["period", "value"])
+        return pd.DataFrame(columns=["period", "soy_usd_bu"])
     try:
-        url = f"https://marsapi.ams.usda.gov/services/v1.2/reports/{report_id}"
+        url = "https://marsapi.ams.usda.gov/services/v1.2/reports/3192/Report%20Detail"
         r = _get_with_retry(url, auth=(USDA_AMS_KEY, ""))
         rows = r.json().get("results", [])
-        df = pd.DataFrame(rows)
-        return df
     except Exception as e:
-        print(f"fetch_ams_daily_price({report_id!r}) failed: {type(e).__name__}: {e}")
-        return pd.DataFrame(columns=["period", "value"])
+        print(f"fetch_ams_daily_soybean_price failed: {type(e).__name__}: {e}")
+        return pd.DataFrame(columns=["period", "soy_usd_bu"])
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=["period", "soy_usd_bu"])
+    df = df[(df["commodity"] == "Soybeans") & (df["trade_loc"] == "Mississippi River")
+            & (df["current"] == "Yes")]
+    if df.empty:
+        return pd.DataFrame(columns=["period", "soy_usd_bu"])
+    df["period"] = pd.to_datetime(df["report_date"], format="%m/%d/%Y")
+    df = df.rename(columns={"avg_price": "soy_usd_bu"})[["period", "soy_usd_bu"]]
+    return df.sort_values("period").drop_duplicates("period").reset_index(drop=True)
+
+
+@st.cache_data(ttl=3600)
+def fetch_ams_weekly_oil_meal() -> pd.DataFrame:
+    """Weekly soybean oil (cents/lb) and soybean meal ($/ton) cash prices for
+    Illinois, from the National Grain and Oilseed Processor Feedstuff Report
+    (AMS_3511). This is USDA's finest free cadence for the two processed legs
+    -- there is no daily public source for them, only for the raw bean.
+    Uses report_end_date (when that week's price became final) rather than
+    report_begin_date, so a later merge_asof against daily soybean prices
+    doesn't look ahead of when the quote was actually published. Empty frame
+    if USDA_AMS_KEY isn't set or the fetch fails.
+    """
+    if not USDA_AMS_KEY:
+        return pd.DataFrame(columns=["period", "oil_cents_lb", "meal_usd_st"])
+    try:
+        url = "https://marsapi.ams.usda.gov/services/v1.2/reports/3511/Report%20Detail"
+        r = _get_with_retry(url, auth=(USDA_AMS_KEY, ""))
+        rows = r.json().get("results", [])
+    except Exception as e:
+        print(f"fetch_ams_weekly_oil_meal failed: {type(e).__name__}: {e}")
+        return pd.DataFrame(columns=["period", "oil_cents_lb", "meal_usd_st"])
+    df = pd.DataFrame(rows)
+    if df.empty or "trade Loc" not in df.columns:
+        return pd.DataFrame(columns=["period", "oil_cents_lb", "meal_usd_st"])
+
+    oil = df[(df["commodity"] == "Soybean Oil") & (df["trade Loc"] == "Illinois")]
+    oil = oil[["report_end_date", "avg_price"]].rename(columns={"avg_price": "oil_cents_lb"})
+
+    meal = df[(df["commodity"] == "Soybean Meal") & (df["trade Loc"] == "Illinois")
+              & (df["trans_mode"] == "Truck")]
+    meal = meal[["report_end_date", "avg_price"]].rename(columns={"avg_price": "meal_usd_st"})
+
+    merged = oil.merge(meal, on="report_end_date", how="outer")
+    merged["period"] = pd.to_datetime(merged["report_end_date"], format="%m/%d/%Y")
+    merged = merged.drop(columns=["report_end_date"]).sort_values("period")
+    return merged.drop_duplicates("period").reset_index(drop=True)
 
 
 # PSD attribute IDs (confirmed against /api/psd/commodityattributes — these
@@ -231,12 +278,34 @@ def build_master() -> dict:
     oil  = fetch_fred("PSOILUSDM").rename(columns={"value": "oil_usd_tonne"})
     meal = fetch_fred("PSMEAUSDM").rename(columns={"value": "meal_usd_tonne"})
 
-    df = soy.merge(oil, on="period").merge(meal, on="period").sort_values("period").reset_index(drop=True)
+    fred = soy.merge(oil, on="period").merge(meal, on="period").sort_values("period").reset_index(drop=True)
 
     # Convert to US industry convention units before applying the board-crush formula.
-    df["soy_usd_bu"]   = df["soy_usd_tonne"] / BUSHELS_PER_METRIC_TON
-    df["oil_cents_lb"] = df["oil_usd_tonne"] / LBS_PER_METRIC_TON * 100
-    df["meal_usd_st"]  = df["meal_usd_tonne"] * (LBS_PER_METRIC_TON / LBS_PER_SHORT_TON)  # metric ton -> short ton price
+    fred["soy_usd_bu"]   = fred["soy_usd_tonne"] / BUSHELS_PER_METRIC_TON
+    fred["oil_cents_lb"] = fred["oil_usd_tonne"] / LBS_PER_METRIC_TON * 100
+    fred["meal_usd_st"]  = fred["meal_usd_tonne"] * (LBS_PER_METRIC_TON / LBS_PER_SHORT_TON)
+    fred["source"] = "FRED monthly (global, IMF-sourced)"
+    fred = fred[["period", "soy_usd_bu", "oil_cents_lb", "meal_usd_st", "source"]]
+
+    # Daily soybean + weekly oil/meal cash prices (USDA AMS), when a key is
+    # set. AMS's oil/meal report only publishes weekly, so it's forward-filled
+    # onto the daily soybean grid (direction="backward": each day gets the
+    # most recent published weekly price, never a future one). FRED covers
+    # everything before AMS's coverage window starts, so the lookback
+    # selector still has years of history even though AMS itself only goes
+    # back to 2022-2023.
+    ams_soy = fetch_ams_daily_soybean_price()
+    ams_om  = fetch_ams_weekly_oil_meal()
+    if not ams_soy.empty and not ams_om.empty:
+        ams = pd.merge_asof(ams_soy, ams_om.dropna(subset=["oil_cents_lb", "meal_usd_st"], how="all"),
+                             on="period", direction="backward")
+        ams = ams.dropna(subset=["oil_cents_lb", "meal_usd_st"], how="any").reset_index(drop=True)
+        ams["source"] = "USDA AMS daily cash (Illinois / Mississippi River)"
+        ams_start = ams["period"].min()
+        df = pd.concat([fred[fred["period"] < ams_start], ams], ignore_index=True)
+    else:
+        df = fred
+    df = df.sort_values("period").reset_index(drop=True)
 
     # Board crush margin, $/bushel: value of the oil + meal one bushel
     # yields, minus the cost of that bushel of soybeans.
@@ -276,9 +345,15 @@ with st.sidebar:
         st.markdown("<div style='font-size:12px;color:#94A3B8'>Stocks-to-use needs USDA_FAS_KEY in secrets.</div>",
                     unsafe_allow_html=True)
     st.divider()
-    st.markdown("<div style='font-size:12px;color:#94A3B8'>Crush margin uses FRED's monthly global prices. "
-                "USDA_AMS_KEY is wired for daily cash prices but not yet used in the margin calc.</div>",
-                unsafe_allow_html=True)
+    if USDA_AMS_KEY:
+        st.markdown("<div style='font-size:12px;color:#94A3B8'>Recent data is daily soybean cash prices "
+                    "(USDA AMS) with weekly oil/meal cash prices forward-filled between updates. "
+                    "Older history falls back to FRED's monthly global prices.</div>",
+                    unsafe_allow_html=True)
+    else:
+        st.markdown("<div style='font-size:12px;color:#94A3B8'>Crush margin uses FRED's monthly global prices. "
+                    "Set USDA_AMS_KEY in secrets for daily cash prices instead.</div>",
+                    unsafe_allow_html=True)
 
 
 # ── Load data ────────────────────────────────────────────────────
@@ -317,7 +392,7 @@ st.markdown("""
 tab1, tab2, tab3 = st.tabs(["Snapshot", "Crush Margin History", "Market Structure"])
 
 with tab1:
-    st.markdown(f"<div style='font-size:12px;color:#94A3B8;margin-bottom:16px'>Last data: {latest['period'].strftime('%d %b %Y')} (FRED, monthly, IMF-sourced global price)</div>",
+    st.markdown(f"<div style='font-size:12px;color:#94A3B8;margin-bottom:16px'>Last data: {latest['period'].strftime('%d %b %Y')} ({latest['source']})</div>",
                 unsafe_allow_html=True)
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Soybeans", f"${latest['soy_usd_bu']:.2f}/bu")
