@@ -48,6 +48,7 @@ C = {
     "meal":       "#7C3AED",
     "margin_pos": "#10B981",
     "margin_neg": "#EF4444",
+    "acres":      "#2563EB",
     "grid":       "rgba(203,213,225,0.4)",
     "bg":         "#FFFFFF",
     "neutral":    "#94A3B8",
@@ -553,13 +554,17 @@ with tab3:
         ), secondary_y=False)
         fyfig.add_trace(go.Scatter(
             x=fnd["year"], y=fnd["planted_acres"] / 1_000_000, name="Planted acres (millions)",
-            mode="lines+markers", line=dict(color=C["soybean"], width=2),
+            mode="lines+markers", line=dict(color=C["acres"], width=2),
         ), secondary_y=True)
         fy_layout = {**PLOT_LAYOUT, "legend": {**PLOT_LAYOUT["legend"], "y": 1.1},
                      "margin": dict(l=60, r=60, t=40, b=40)}
         fyfig.update_layout(**fy_layout, height=340, showlegend=True)
         fyfig.update_xaxes(showgrid=False, type="category", title_text="Crop Year")
-        fyfig.update_yaxes(title_text="Yield (bu/acre)", showgrid=True, gridcolor=C["grid"], secondary_y=False)
+        # Headroom above the tallest bar so the "outside" text label (e.g.
+        # "53.0") isn't clipped by the plot's top edge.
+        yield_pad = fnd["yield_bu_acre"].max() * 0.15
+        fyfig.update_yaxes(title_text="Yield (bu/acre)", showgrid=True, gridcolor=C["grid"],
+                            range=[0, fnd["yield_bu_acre"].max() + yield_pad], secondary_y=False)
         fyfig.update_yaxes(title_text="Planted Acres (millions)", showgrid=False, secondary_y=True)
         st.plotly_chart(fyfig, use_container_width=True)
 
