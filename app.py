@@ -358,7 +358,13 @@ with tab2:
         fillcolor="rgba(239,68,68,0.15)", line=dict(color=C["margin_neg"], width=1.5)), row=2, col=1)
     fig.add_hline(y=0, line_dash="dash", line_color="#94A3B8", line_width=1, row=2, col=1)
 
-    fig.update_layout(**PLOT_LAYOUT, height=650)
+    # Override the shared legend position for this figure specifically: the
+    # default y=1.02 sits right on top of the row-1 subplot title in a
+    # multi-row figure (shared legend is figure-level, subplot_titles are
+    # per-row), so push it higher and widen the top margin to give both room.
+    hist_layout = {**PLOT_LAYOUT, "legend": {**PLOT_LAYOUT["legend"], "y": 1.08},
+                   "margin": dict(l=60, r=40, t=70, b=40)}
+    fig.update_layout(**hist_layout, height=650)
     fig.update_yaxes(showgrid=True, gridcolor=C["grid"])
     fig.update_xaxes(showgrid=False)
     st.plotly_chart(fig, use_container_width=True)
