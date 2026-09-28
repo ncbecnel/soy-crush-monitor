@@ -576,4 +576,4 @@ with tab3:
             unsafe_allow_html=True
         )
 
-st.caption(f"Data: FRED (IMF global prices), USDA FAS PSD Online, USDA NASS QuickStats | Built by Nicholas Becnel | {datetime.today().strftime('%d %b %Y')}")
+st.caption("Data: FRED (IMF global prices), USDA FAS PSD Online, USDA NASS QuickStats | Built by Nicholas Becnel")
