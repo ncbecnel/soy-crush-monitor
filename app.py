@@ -258,6 +258,49 @@ PSD_CODE_SOYBEANS      = "2222000"  # "Oilseed, Soybean"
 PSD_CODE_SOYBEAN_MEAL   = "0813100"  # "Meal, Soybean"
 PSD_CODE_SOYBEAN_OIL    = "4232000"  # "Oil, Soybean"
 
+
+@st.cache_data(ttl=3600)
+def fetch_nass_soybean_fundamentals() -> pd.DataFrame:
+    """US national soybean planted acreage, yield, and production by year
+    (USDA NASS QuickStats, annual survey estimates). Upstream supply-side
+    context for stocks-to-use: a bad yield year mechanically tightens next
+    season's stocks, and planted acreage is the decision farmers make each
+    spring partly in response to crush/relative-price economics. Empty frame
+    if USDA_NASS_KEY isn't set or every series fails.
+    """
+    if not USDA_NASS_KEY:
+        return pd.DataFrame(columns=["year", "planted_acres", "yield_bu_acre", "production_bu"])
+    base = "https://quickstats.nass.usda.gov/api/api_GET/"
+    common = {
+        "key": USDA_NASS_KEY, "commodity_desc": "SOYBEANS",
+        "agg_level_desc": "NATIONAL", "source_desc": "SURVEY",
+        "reference_period_desc": "YEAR", "year__GE": 2012, "format": "JSON",
+    }
+    series = {
+        "planted_acres":  "SOYBEANS - ACRES PLANTED",
+        "yield_bu_acre":  "SOYBEANS - YIELD, MEASURED IN BU / ACRE",
+        "production_bu":  "SOYBEANS - PRODUCTION, MEASURED IN BU",
+    }
+    frames = []
+    for col, short_desc in series.items():
+        try:
+            r = _get_with_retry(base, params={**common, "short_desc": short_desc}, retries=2)
+            rows = r.json().get("data", [])
+        except Exception as e:
+            print(f"fetch_nass_soybean_fundamentals({col!r}) failed: {type(e).__name__}: {e}")
+            continue
+        if not rows:
+            continue
+        fdf = pd.DataFrame(rows)
+        fdf[col] = fdf["Value"].str.replace(",", "", regex=False).astype(float)
+        frames.append(fdf[["year", col]])
+    if not frames:
+        return pd.DataFrame(columns=["year", "planted_acres", "yield_bu_acre", "production_bu"])
+    out = frames[0]
+    for f in frames[1:]:
+        out = out.merge(f, on="year", how="outer")
+    return out.sort_values("year").reset_index(drop=True)
+
 # Standard "board crush" yields per bushel (60 lbs) of soybeans, the CBOT
 # industry-standard conversion: ~11 lbs oil + ~44 lbs meal per bushel
 # processed. The remaining ~5 lbs is hulls/moisture loss and isn't priced.
@@ -319,9 +362,14 @@ def build_master() -> dict:
     # volatility and seasonality.
     stu = fetch_psd_stocks_to_use(PSD_CODE_SOYBEANS)
 
+    # US planted acreage / yield / production (optional, needs USDA_NASS_KEY)
+    # — the production-side driver upstream of stocks-to-use above.
+    fundamentals = fetch_nass_soybean_fundamentals()
+
     return {
         "crush": df,
         "stocks_to_use": stu,
+        "fundamentals": fundamentals,
     }
 
 
@@ -389,7 +437,7 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-tab1, tab2, tab3 = st.tabs(["Snapshot", "Crush Margin History", "Market Structure"])
+tab1, tab2, tab3 = st.tabs(["Snapshot", "Crush Margin History", "Supply & Demand"])
 
 with tab1:
     st.markdown(f"<div style='font-size:12px;color:#94A3B8;margin-bottom:16px'>Last data: {latest['period'].strftime('%d %b %Y')} ({latest['source']})</div>",
@@ -480,4 +528,47 @@ with tab3:
             unsafe_allow_html=True
         )
 
-st.caption(f"Data: FRED (IMF global prices), USDA FAS PSD Online | Built by Nicholas Becnel | {datetime.today().strftime('%d %b %Y')}")
+    st.divider()
+    st.markdown("<div class='section-title'>US Planted Acreage &amp; Yield</div>", unsafe_allow_html=True)
+    fnd = data["fundamentals"]
+    if len(fnd) == 0:
+        st.info(
+            "USDA_NASS_KEY isn't set (or every request failed), so this section is empty. "
+            "Acreage and yield are the production-side drivers upstream of stocks-to-use above: "
+            "a weak yield year mechanically tightens next season's stocks, and planted acreage is "
+            "the decision farmers make each spring, partly in response to crush economics like the "
+            "margin on the other tabs."
+        )
+    else:
+        st.caption(
+            "Yield (bars, left axis) and planted acreage (line, right axis) by crop year, USDA NASS "
+            "annual survey. A weak yield year tightens next season's stocks-to-use; acreage reflects "
+            "what farmers actually planted that spring."
+        )
+        fyfig = make_subplots(specs=[[{"secondary_y": True}]])
+        fyfig.add_trace(go.Bar(
+            x=fnd["year"], y=fnd["yield_bu_acre"], name="Yield (bu/acre)",
+            marker_color=C["oil"],
+            text=[f"{v:.1f}" for v in fnd["yield_bu_acre"]], textposition="outside",
+        ), secondary_y=False)
+        fyfig.add_trace(go.Scatter(
+            x=fnd["year"], y=fnd["planted_acres"] / 1_000_000, name="Planted acres (millions)",
+            mode="lines+markers", line=dict(color=C["soybean"], width=2),
+        ), secondary_y=True)
+        fy_layout = {**PLOT_LAYOUT, "legend": {**PLOT_LAYOUT["legend"], "y": 1.1},
+                     "margin": dict(l=60, r=60, t=40, b=40)}
+        fyfig.update_layout(**fy_layout, height=340, showlegend=True)
+        fyfig.update_xaxes(showgrid=False, type="category", title_text="Crop Year")
+        fyfig.update_yaxes(title_text="Yield (bu/acre)", showgrid=True, gridcolor=C["grid"], secondary_y=False)
+        fyfig.update_yaxes(title_text="Planted Acres (millions)", showgrid=False, secondary_y=True)
+        st.plotly_chart(fyfig, use_container_width=True)
+
+        latest_fnd = fnd.iloc[-1]
+        st.markdown(
+            f"<div style='font-size:12px;color:#94A3B8'>Most recent crop year ({int(latest_fnd['year'])}): "
+            f"{latest_fnd['yield_bu_acre']:.1f} bu/acre on {latest_fnd['planted_acres']/1_000_000:.1f}M planted acres "
+            f"({latest_fnd['production_bu']/1_000_000_000:.2f}B bushels produced)</div>",
+            unsafe_allow_html=True
+        )
+
+st.caption(f"Data: FRED (IMF global prices), USDA FAS PSD Online, USDA NASS QuickStats | Built by Nicholas Becnel | {datetime.today().strftime('%d %b %Y')}")
